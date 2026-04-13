@@ -11,7 +11,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from zoneinfo import ZoneInfo
@@ -41,6 +41,18 @@ class Config:
     request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "10"))
     state_file: str = os.getenv("STATE_FILE", "alert_state.json")
     twelvedata_api_key: str = os.getenv("TWELVEDATA_API_KEY", "demo").strip()
+    swing_enabled: bool = os.getenv("SWING_ENABLED", "true").lower() in {"1", "true", "yes"}
+    swing_cooldown_hours: int = int(os.getenv("SWING_COOLDOWN_HOURS", "168"))
+    swing_max_alerts_per_month: int = int(os.getenv("SWING_MAX_ALERTS_PER_MONTH", "2"))
+    account_size_usd: float = float(os.getenv("ACCOUNT_SIZE_USD", "20000"))
+    swing_risk_per_trade_pct: float = float(os.getenv("SWING_RISK_PER_TRADE_PCT", "0.8"))
+    swing_max_position_pct: float = float(os.getenv("SWING_MAX_POSITION_PCT", "35"))
+    swing_min_pullback_pct: float = float(os.getenv("SWING_MIN_PULLBACK_PCT", "4"))
+    swing_max_pullback_pct: float = float(os.getenv("SWING_MAX_PULLBACK_PCT", "12"))
+    swing_stop_pct_crypto: float = float(os.getenv("SWING_STOP_PCT_CRYPTO", "4.5"))
+    swing_stop_pct_qqq: float = float(os.getenv("SWING_STOP_PCT_QQQ", "2.2"))
+    swing_max_atr_pct_crypto: float = float(os.getenv("SWING_MAX_ATR_PCT_CRYPTO", "8"))
+    swing_max_atr_pct_qqq: float = float(os.getenv("SWING_MAX_ATR_PCT_QQQ", "4"))
     run_once: bool = os.getenv("RUN_ONCE", "false").lower() in {"1", "true", "yes"}
 
 
@@ -249,7 +261,7 @@ class TelegramClient:
 class CooldownStore:
     def __init__(self, path: str) -> None:
         self.path = path
-        self.state: Dict[str, str] = {}
+        self.state: Dict[str, Any] = {}
         self._load()
 
     def _load(self) -> None:
@@ -270,6 +282,8 @@ class CooldownStore:
         raw = self.state.get(key)
         if not raw:
             return False
+        if not isinstance(raw, str):
+            return False
         try:
             last = datetime.fromisoformat(raw)
         except ValueError:
@@ -279,6 +293,19 @@ class CooldownStore:
     def mark_sent(self, key: str) -> None:
         self.state[key] = datetime.now(tz=UTC).isoformat()
         self._save()
+
+    def get_int(self, key: str, default: int = 0) -> int:
+        raw = self.state.get(key, default)
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return default
+
+    def increment_int(self, key: str, delta: int = 1) -> int:
+        value = self.get_int(key, 0) + delta
+        self.state[key] = value
+        self._save()
+        return value
 
 
 ASSETS = [
@@ -309,6 +336,117 @@ def format_price(value: float) -> str:
     if value >= 1:
         return f"{value:,.4f}"
     return f"{value:,.6f}"
+
+
+def calculate_ema(values: List[float], period: int) -> List[float]:
+    if not values:
+        return []
+    alpha = 2.0 / (period + 1.0)
+    out: List[float] = []
+    ema_value = values[0]
+    out.append(ema_value)
+    for v in values[1:]:
+        ema_value = alpha * v + (1.0 - alpha) * ema_value
+        out.append(ema_value)
+    return out
+
+
+def calculate_atr_pct(candles: List[Candle], period: int = 14) -> Optional[float]:
+    if len(candles) < period + 1:
+        return None
+    tr_values: List[float] = []
+    for i in range(1, len(candles)):
+        c = candles[i]
+        prev_close = candles[i - 1].close
+        tr = max(c.high - c.low, abs(c.high - prev_close), abs(c.low - prev_close))
+        tr_values.append(tr)
+    if len(tr_values) < period:
+        return None
+    atr = sum(tr_values[-period:]) / period
+    current = candles[-1].close
+    if current <= 0:
+        return None
+    return atr / current * 100.0
+
+
+def _fetch_swing_candles(data_client: MarketDataClient, asset: dict) -> Tuple[List[Candle], List[Candle]]:
+    if asset["source"] == "binance":
+        daily = data_client.fetch_binance_klines(asset["symbol"], "1d", limit=300)
+        intraday = data_client.fetch_binance_klines(asset["symbol"], "4h", limit=180)
+    else:
+        daily = data_client.fetch_equity_chart(asset["symbol"], "1d", "1y", outputsize=300)
+        intraday = data_client.fetch_equity_chart(asset["symbol"], "60m", "1mo", outputsize=220)
+    return daily, intraday
+
+
+def detect_swing_pullback(
+    data_client: MarketDataClient,
+    asset: dict,
+    cfg: Config,
+    fear_greed: Optional[Tuple[int, str]],
+) -> Optional[dict]:
+    daily, intraday = _fetch_swing_candles(data_client, asset)
+    if len(daily) < 210:
+        return None
+
+    closes = [c.close for c in daily]
+    ema20 = calculate_ema(closes, 20)
+    ema50 = calculate_ema(closes, 50)
+    ema200 = calculate_ema(closes, 200)
+
+    current = closes[-1]
+    trend_ok = current > ema50[-1] and ema50[-1] > ema200[-1] and ema20[-1] >= ema50[-1]
+    if not trend_ok:
+        return None
+
+    lookback_high = max(c.high for c in daily[-20:])
+    pullback_abs_pct = abs(min(0.0, pct_change(current, lookback_high)))
+    pullback_ok = cfg.swing_min_pullback_pct <= pullback_abs_pct <= cfg.swing_max_pullback_pct
+    if not pullback_ok:
+        return None
+
+    if len(intraday) >= 2:
+        stabilization_ok = intraday[-1].close > intraday[-2].close and intraday[-1].close > intraday[-1].open
+    else:
+        stabilization_ok = daily[-1].close > daily[-2].close
+    if not stabilization_ok:
+        return None
+
+    atr_pct = calculate_atr_pct(daily, 14)
+    if atr_pct is None:
+        return None
+    if asset["source"] == "binance":
+        volatility_ok = atr_pct <= cfg.swing_max_atr_pct_crypto
+    else:
+        volatility_ok = atr_pct <= cfg.swing_max_atr_pct_qqq
+    if not volatility_ok:
+        return None
+
+    if asset["source"] == "binance" and fear_greed is not None:
+        # Avoid extreme sentiment zones where short-term swing quality drops.
+        if fear_greed[0] < 12 or fear_greed[0] > 85:
+            return None
+
+    stop_pct = cfg.swing_stop_pct_crypto if asset["source"] == "binance" else cfg.swing_stop_pct_qqq
+    risk_usd = cfg.account_size_usd * cfg.swing_risk_per_trade_pct / 100.0
+    raw_position_usd = risk_usd / max(stop_pct / 100.0, 1e-9)
+    max_position_usd = cfg.account_size_usd * cfg.swing_max_position_pct / 100.0
+    position_usd = min(raw_position_usd, max_position_usd)
+
+    return {
+        "type": "swing_pullback",
+        "current_price": current,
+        "entry_low": current * 0.997,
+        "entry_high": current * 1.003,
+        "stop_price": current * (1 - stop_pct / 100.0),
+        "tp1_price": current * (1 + stop_pct * 1.5 / 100.0),
+        "tp2_price": current * (1 + stop_pct * 2.5 / 100.0),
+        "risk_usd": risk_usd,
+        "position_usd": position_usd,
+        "pullback_pct": pullback_abs_pct,
+        "atr_pct": atr_pct,
+        "trend_ref": {"ema20": ema20[-1], "ema50": ema50[-1], "ema200": ema200[-1]},
+    }
 
 
 def get_reference_72h(candles: List[Candle], now_utc: datetime) -> Optional[float]:
@@ -480,6 +618,32 @@ def build_alert_message(
     )
 
 
+def build_swing_message(
+    asset_label: str,
+    signal: dict,
+    cfg: Config,
+    fear_greed: Optional[Tuple[int, str]],
+) -> str:
+    fng_text = "N/A"
+    if fear_greed is not None and asset_label in {"BTC", "ETH"}:
+        fng_text = f"{fear_greed[0]} ({fear_greed[1]})"
+    stop_pct = cfg.swing_stop_pct_crypto if asset_label in {"BTC", "ETH"} else cfg.swing_stop_pct_qqq
+    return (
+        f"📈⚙️ {asset_label} 低频波段策略信号（新增策略）\n"
+        f"🧭 类型：顺势回调做多（1-2笔/月）\n"
+        f"📉 回撤幅度：{signal['pullback_pct']:.2f}%（近20日高点回撤）\n"
+        f"🌊 波动过滤：ATR14={signal['atr_pct']:.2f}%\n"
+        f"💵 当前价：${format_price(signal['current_price'])}\n"
+        f"🎯 入场参考：${format_price(signal['entry_low'])} ~ ${format_price(signal['entry_high'])}\n"
+        f"🛡️ 止损参考：${format_price(signal['stop_price'])}（约{stop_pct:.2f}%）\n"
+        f"🏁 止盈参考：TP1 ${format_price(signal['tp1_price'])} / TP2 ${format_price(signal['tp2_price'])}\n"
+        f"📦 仓位建议：约 ${signal['position_usd']:.0f} 名义仓位（单笔风险约 ${signal['risk_usd']:.0f}）\n"
+        f"⏱️ 持仓建议：7-20天，分批止盈，失效则止损离场\n"
+        f"🧪 辅助确认：恐慌指数={fng_text}\n"
+        f"⚠️ 提醒：此为策略信号，不保证收益；请严格执行仓位与止损。"
+    )
+
+
 def validate_env(cfg: Config) -> None:
     missing = []
     if not cfg.telegram_bot_token:
@@ -492,6 +656,7 @@ def validate_env(cfg: Config) -> None:
 
 def run_cycle(cfg: Config, data_client: MarketDataClient, tg: TelegramClient, store: CooldownStore) -> None:
     fear_greed = data_client.fetch_fear_greed()
+    month_key = f"SWING_MONTHLY_COUNT|{datetime.now(tz=UTC).strftime('%Y-%m')}"
     for asset in ASSETS:
         asset_label = asset["label"]
 
@@ -548,6 +713,44 @@ def run_cycle(cfg: Config, data_client: MarketDataClient, tg: TelegramClient, st
             else:
                 logging.info("Cooldown active: %s", key)
 
+        if cfg.swing_enabled:
+            try:
+                swing_signal = detect_swing_pullback(
+                    data_client=data_client,
+                    asset=asset,
+                    cfg=cfg,
+                    fear_greed=fear_greed,
+                )
+            except Exception as exc:
+                logging.exception("Swing detection failed for %s: %s", asset_label, exc)
+                swing_signal = None
+
+            if swing_signal:
+                current_month_count = store.get_int(month_key, 0)
+                if current_month_count >= cfg.swing_max_alerts_per_month:
+                    logging.info(
+                        "Swing monthly cap reached (%s/%s), skip %s",
+                        current_month_count,
+                        cfg.swing_max_alerts_per_month,
+                        asset_label,
+                    )
+                    continue
+
+                key = f"{asset['id']}|swing_pullback"
+                if not store.is_in_cooldown(key, cfg.swing_cooldown_hours):
+                    msg = build_swing_message(
+                        asset_label=asset_label,
+                        signal=swing_signal,
+                        cfg=cfg,
+                        fear_greed=fear_greed,
+                    )
+                    tg.send_message(msg)
+                    store.mark_sent(key)
+                    new_count = store.increment_int(month_key, 1)
+                    logging.warning("Swing alert sent: %s (monthly=%s)", key, new_count)
+                else:
+                    logging.info("Swing cooldown active: %s", key)
+
 
 def main() -> None:
     logging.basicConfig(
@@ -568,7 +771,11 @@ def main() -> None:
     )
     store = CooldownStore(cfg.state_file)
 
-    logging.info("Crash monitor started for assets: %s", ", ".join(a["label"] for a in ASSETS))
+    logging.info(
+        "Crash monitor started for assets: %s | swing_enabled=%s",
+        ", ".join(a["label"] for a in ASSETS),
+        cfg.swing_enabled,
+    )
     while True:
         try:
             run_cycle(cfg, data_client, tg, store)

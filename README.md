@@ -8,6 +8,12 @@
 - 防重复：同一资产 + 同一条件 `24 小时`内只通知一次
 - 只在触发时推送，不持续播报
 
+同时支持第二套独立策略（不影响原策略）：
+
+- 低频波段策略：`BTC/ETH/QQQ` 顺势回调信号
+- 目标风格：每月 `1-2` 次机会，强调仓位与止损控制
+- 新策略自带独立冷却（默认 7 天）和月度通知上限（默认 2 条）
+
 ## 数据源
 
 - `Binance`：BTC/ETH 实时价格与 K 线
@@ -24,6 +30,12 @@
 - 当前价格与关键支撑参考
 - 交易建议：考虑立即分批买入，买入后 24 小时内分批卖出
 - 风险提示：高风险短线，仅供参考，注意仓位与止损
+
+低频波段策略通知会额外给出：
+
+- 入场区间、止损、止盈1/止盈2
+- 基于账户规模与单笔风险的建议仓位
+- 适合 7-20 天持有的执行建议
 
 ## 快速开始
 
@@ -44,6 +56,7 @@ cp .env.example .env
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `TWELVEDATA_API_KEY`（可先用默认 `demo`，生产建议替换成你自己的 key）
+- （可选）低频波段参数，见下方“关键参数”
 
 3. 运行：
 
@@ -74,6 +87,15 @@ RUN_ONCE=true python3 monitor_bot.py
 - `WICK_THRESHOLD_PCT`：插针阈值（默认 8）
 - `WICK_VOLUME_SPIKE_RATIO`：成交量放大辅助阈值（默认 1.8）
 - `TWELVEDATA_API_KEY`：QQQ 备用数据源 key（默认 demo）
+- `SWING_ENABLED`：是否启用低频波段策略（默认 true）
+- `SWING_COOLDOWN_HOURS`：低频波段同资产冷却（默认 168 小时）
+- `SWING_MAX_ALERTS_PER_MONTH`：低频波段全局月度通知上限（默认 2）
+- `ACCOUNT_SIZE_USD`：用于仓位建议的账户总资金（默认 20000）
+- `SWING_RISK_PER_TRADE_PCT`：单笔风险占总资金（默认 0.8%）
+- `SWING_MAX_POSITION_PCT`：单笔最大仓位占总资金（默认 35%）
+- `SWING_MIN_PULLBACK_PCT` / `SWING_MAX_PULLBACK_PCT`：回调区间过滤
+- `SWING_STOP_PCT_CRYPTO` / `SWING_STOP_PCT_QQQ`：建议止损比例
+- `SWING_MAX_ATR_PCT_CRYPTO` / `SWING_MAX_ATR_PCT_QQQ`：波动过滤阈值
 
 ## 说明
 
