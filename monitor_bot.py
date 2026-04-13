@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
+from zoneinfo import ZoneInfo
 
 
 UTC = timezone.utc
@@ -39,13 +40,23 @@ class Config:
     wick_volume_spike_ratio: float = float(os.getenv("WICK_VOLUME_SPIKE_RATIO", "1.8"))
     request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "10"))
     state_file: str = os.getenv("STATE_FILE", "alert_state.json")
+    twelvedata_api_key: str = os.getenv("TWELVEDATA_API_KEY", "demo").strip()
     run_once: bool = os.getenv("RUN_ONCE", "false").lower() in {"1", "true", "yes"}
 
 
 class MarketDataClient:
-    def __init__(self, timeout_seconds: int = 10) -> None:
+    def __init__(self, timeout_seconds: int = 10, twelvedata_api_key: str = "demo") -> None:
         self.session = requests.Session()
         self.timeout_seconds = timeout_seconds
+        self.twelvedata_api_key = twelvedata_api_key
+        self.session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
+            }
+        )
 
     def _get_json(self, url: str, params: Optional[Dict[str, str]] = None) -> dict:
         resp = self.session.get(url, params=params, timeout=self.timeout_seconds)
@@ -120,6 +131,93 @@ class MarketDataClient:
             except (IndexError, TypeError, ValueError):
                 continue
         return candles
+
+    def fetch_twelvedata_chart(self, symbol: str, interval: str, outputsize: int) -> List[Candle]:
+        if not self.twelvedata_api_key:
+            return []
+
+        data = self._get_json(
+            "https://api.twelvedata.com/time_series",
+            params={
+                "symbol": symbol,
+                "interval": interval,
+                "outputsize": str(outputsize),
+                "apikey": self.twelvedata_api_key,
+            },
+        )
+        values = data.get("values", [])
+        if not values:
+            return []
+
+        tz_name = data.get("meta", {}).get("exchange_timezone", "UTC")
+        try:
+            local_tz = ZoneInfo(tz_name)
+        except Exception:
+            local_tz = UTC
+
+        candles: List[Candle] = []
+        for row in values:
+            dt_str = row.get("datetime")
+            if not dt_str:
+                continue
+            try:
+                if len(dt_str) == 10:
+                    dt_local = datetime.strptime(dt_str, "%Y-%m-%d").replace(
+                        hour=0, minute=0, second=0, tzinfo=local_tz
+                    )
+                else:
+                    dt_local = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(
+                        tzinfo=local_tz
+                    )
+                ts_utc = dt_local.astimezone(UTC)
+
+                candles.append(
+                    Candle(
+                        ts=ts_utc,
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        volume=float(row.get("volume") or 0.0),
+                    )
+                )
+            except (ValueError, TypeError, KeyError):
+                continue
+
+        candles.sort(key=lambda x: x.ts)
+        return candles
+
+    def fetch_equity_chart(
+        self, symbol: str, interval: str, range_value: str, outputsize: int
+    ) -> List[Candle]:
+        try:
+            candles = self.fetch_yahoo_chart(symbol, interval, range_value)
+            if candles:
+                return candles
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status is not None:
+                logging.warning(
+                    "Yahoo chart rate/HTTP error for %s %s %s: %s. Falling back to TwelveData.",
+                    symbol,
+                    interval,
+                    range_value,
+                    status,
+                )
+        except Exception as exc:
+            logging.warning(
+                "Yahoo chart failed for %s %s %s: %s. Falling back to TwelveData.",
+                symbol,
+                interval,
+                range_value,
+                exc,
+            )
+
+        td_interval_map = {"5m": "5min", "15m": "15min", "60m": "1h", "1d": "1day"}
+        td_interval = td_interval_map.get(interval)
+        if not td_interval:
+            return []
+        return self.fetch_twelvedata_chart(symbol, td_interval, outputsize)
 
     def fetch_fear_greed(self) -> Optional[Tuple[int, str]]:
         try:
@@ -231,8 +329,8 @@ def detect_three_day_drop(
         daily = data_client.fetch_binance_klines(asset["symbol"], "1d", limit=10)
         current_price = data_client.fetch_binance_price(asset["symbol"])
     else:
-        hourly = data_client.fetch_yahoo_chart(asset["symbol"], "60m", "10d")
-        daily = data_client.fetch_yahoo_chart(asset["symbol"], "1d", "1mo")
+        hourly = data_client.fetch_equity_chart(asset["symbol"], "60m", "10d", outputsize=200)
+        daily = data_client.fetch_equity_chart(asset["symbol"], "1d", "1mo", outputsize=30)
         current_price = hourly[-1].close if hourly else (daily[-1].close if daily else 0.0)
 
     if current_price <= 0:
@@ -323,7 +421,10 @@ def detect_flash_wick(
         else:
             yahoo_interval = "60m" if tf_name == "1h" else tf_name
             yahoo_range = "5d" if tf_name in {"5m", "15m"} else "1mo"
-            candles = data_client.fetch_yahoo_chart(asset["symbol"], yahoo_interval, yahoo_range)
+            outputsize = 200 if tf_name in {"5m", "15m"} else 120
+            candles = data_client.fetch_equity_chart(
+                asset["symbol"], yahoo_interval, yahoo_range, outputsize=outputsize
+            )
 
         signal = _detect_recent_wick_in_candles(
             candles=candles,
@@ -456,7 +557,10 @@ def main() -> None:
     cfg = Config()
     validate_env(cfg)
 
-    data_client = MarketDataClient(timeout_seconds=cfg.request_timeout_seconds)
+    data_client = MarketDataClient(
+        timeout_seconds=cfg.request_timeout_seconds,
+        twelvedata_api_key=cfg.twelvedata_api_key,
+    )
     tg = TelegramClient(
         bot_token=cfg.telegram_bot_token,
         chat_id=cfg.telegram_chat_id,

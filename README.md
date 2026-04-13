@@ -11,7 +11,8 @@
 ## 数据源
 
 - `Binance`：BTC/ETH 实时价格与 K 线
-- `Yahoo Finance`：QQQ（纳斯达克100代理）K 线
+- `Yahoo Finance`：QQQ（纳斯达克100代理）K 线（首选）
+- `TwelveData`：当 Yahoo 返回限流（429）时自动回退
 - `Alternative.me`：Fear & Greed 指数（辅助确认）
 
 ## Telegram 消息内容
@@ -42,6 +43,7 @@ cp .env.example .env
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
+- `TWELVEDATA_API_KEY`（可先用默认 `demo`，生产建议替换成你自己的 key）
 
 3. 运行：
 
@@ -71,6 +73,7 @@ RUN_ONCE=true python3 monitor_bot.py
 - `DROP_THRESHOLD_PCT`：3日累计跌幅触发阈值（默认 10）
 - `WICK_THRESHOLD_PCT`：插针阈值（默认 8）
 - `WICK_VOLUME_SPIKE_RATIO`：成交量放大辅助阈值（默认 1.8）
+- `TWELVEDATA_API_KEY`：QQQ 备用数据源 key（默认 demo）
 
 ## 说明
 
