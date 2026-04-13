@@ -1,0 +1,18 @@
+[Unit]
+Description=BTC/ETH/Nasdaq Flash-Crash Telegram Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_WITH_YOUR_USER
+WorkingDirectory=REPLACE_WITH_PROJECT_DIR
+ExecStart=/usr/bin/env bash -lc 'cd REPLACE_WITH_PROJECT_DIR && ./scripts/run_monitor.sh'
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
