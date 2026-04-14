@@ -31,8 +31,8 @@ class Candle:
 
 
 class Config:
-    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    telegram_bot_token: str = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    telegram_chat_id: str = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
     poll_interval_seconds: int = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
     cooldown_hours: int = int(os.getenv("COOLDOWN_HOURS", "24"))
     drop_threshold_pct: float = float(os.getenv("DROP_THRESHOLD_PCT", "10"))
@@ -288,6 +288,8 @@ class CooldownStore:
             last = datetime.fromisoformat(raw)
         except ValueError:
             return False
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=UTC)
         return datetime.now(tz=UTC) - last < timedelta(hours=hours)
 
     def mark_sent(self, key: str) -> None:
